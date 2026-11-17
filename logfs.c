@@ -179,7 +179,7 @@ void logfs_close(struct logfs* logfs){
 int logfs_read(struct logfs *logfs, void *buf, uint64_t off, size_t len);
 
 int logfs_append(struct logfs *logfs, const void *buf, uint64_t len){
-    uint64_t free_space, H, wbuf_size, first_copy_size;
+    uint64_t free_space, H, wbuf_size, first_copy_size, chunk_size;
     const char *new_data_buf;
     
     new_data_buf = (const char *)buf;
@@ -194,23 +194,28 @@ int logfs_append(struct logfs *logfs, const void *buf, uint64_t len){
         return -1;
     } 
 
-    /* ensure wbuf has enough free space to fit the full append, if not wait on space_avail signal */
-    here: 
-        free_space = (logfs->B * WCACHE_BLOCKS) - (logfs->head - logfs->tail); /* capacity - space occupied */
-        if (len > free_space){
-            pthread_cond_wait(&logfs->space_avail, &logfs->mutex);
-            goto here;
-        }
-
     while (len){
+        /* Avoid deadlock by defining an accurate chunk size */
+        chunk_size = MIN(len, (WCACHE_BLOCKS - 1) * logfs->B);
+
+        /* Ensure wbuf has enough free space to fit the full append, if not wait on space_avail signal */
+        here: 
+            free_space = (wbuf_size) - (logfs->head - logfs->tail); /* capacity - space occupied */
+            if (chunk_size > free_space){
+                pthread_cond_wait(&logfs->space_avail, &logfs->mutex);
+                goto here;
+            }
+
+        /* Check for a wrap around which will split into 2 memcpy()s */
         H = logfs->head % wbuf_size;
-        first_copy_size = MIN(len, wbuf_size - H);
+        first_copy_size = MIN(chunk_size, wbuf_size - H);
         memcpy(logfs->wbuf + H, new_data_buf, (size_t)first_copy_size);
-        if (first_copy_size < len){
-            memcpy(logfs->wbuf, new_data_buf + first_copy_size, (size_t)(len - first_copy_size));
+        if (first_copy_size < chunk_size){
+            memcpy(logfs->wbuf, new_data_buf + first_copy_size, (size_t)(chunk_size - first_copy_size));
         }
-        logfs->head += len;
-        len = 0;
+        logfs->head += chunk_size;
+        len -= chunk_size;
+        new_data_buf += chunk_size;
         pthread_cond_signal(&logfs->data_avail);
     }
     pthread_mutex_unlock(&logfs->mutex);
