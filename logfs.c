@@ -219,9 +219,75 @@ void logfs_close(struct logfs* logfs){
     FREE(logfs);
 }
 
-int logfs_read(struct logfs *logfs, void *buf, uint64_t off, size_t len);
+int logfs_read(struct logfs *logfs, void *buf, uint64_t off, size_t len) {
+    uint64_t blk, skip_data, wbuf_index, wbuf_size, copy_size, offi;
+    char *out;
 
-int logfs_append(struct logfs *logfs, const void *buf, uint64_t len){
+    assert ( logfs );
+    assert ( !len || buf );
+    if (0 == len) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&logfs->mutex);
+
+    /* Check the requested read fits inside allocated data */
+    if (off + len > logfs->head) {
+        pthread_mutex_unlock(&logfs->mutex);
+        TRACE("requested read beyond allocated data");
+        return -1;
+    }
+
+    out = (char *)buf;
+    wbuf_size = WCACHE_BLOCKS * logfs->B;
+    
+    while (len) {
+        /* Get the block aligned start for our read */
+        blk = off - (off % logfs->B); 
+        skip_data = (off % logfs->B);
+
+        /* Check if we are reading from buffer and not device */
+        if (blk >= logfs->tail) {
+            wbuf_index = off % wbuf_size;
+            /* Potentially split memcpy()s if it wraps around wbuf */
+            copy_size = MIN(len, wbuf_size - wbuf_index);
+            memcpy(out, logfs->wbuf + wbuf_index, (size_t)copy_size);
+            out += copy_size;
+            if (copy_size < len){
+                memcpy(out, logfs->wbuf, (size_t)(len - copy_size));
+                out += (len - copy_size);
+            }
+            off += len;
+            len = 0;
+        }
+        /* Blocks will reference cache or be pulled from device */
+        else {
+            offi = (blk / logfs->B) % RCACHE_BLOCKS;
+
+            /* Cache Miss - fill cache from device read*/
+            if ( (!logfs->rc_valid[offi]) || (logfs->rc_offs[offi] != blk)) {
+                if (device_read(logfs->D, logfs->rbuf + (logfs->B * offi), blk, logfs->B) != 0) {
+                    pthread_mutex_unlock(&logfs->mutex);
+                    TRACE("device read failure logfs");
+                    return -1;
+                }
+                logfs->rc_valid[offi] = 1;
+                logfs->rc_offs[offi] = blk;
+            }
+            /* Update out from cache */
+            copy_size = MIN(len, logfs->B - skip_data);
+            memcpy(out, logfs->rbuf + (logfs->B * offi) + skip_data, (size_t)copy_size);
+            len -= copy_size;
+            off += copy_size;
+            out += copy_size;
+            
+        }
+    }
+    pthread_mutex_unlock(&logfs->mutex);
+    return 0;
+}
+
+int logfs_append(struct logfs *logfs, const void *buf, uint64_t len) {
     uint64_t free_space, H, wbuf_size, first_copy_size, chunk_size;
     const char *new_data_buf;
 
