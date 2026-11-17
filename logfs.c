@@ -49,13 +49,56 @@ struct logfs {
     int data_ok;
     int space_ok;
     int worker_ok;
+    int error;
     
 };
 
 static void *worker_engine(void *arg){
-    /* struct logfs *logfs = (struct logfs *)arg; */
+    struct logfs *logfs = (struct logfs *)arg;
+    uint64_t wbuf_data_size, T, wbuf_size;
 
-    return arg;
+    wbuf_size = (WCACHE_BLOCKS * logfs->B);
+    pthread_mutex_lock(&logfs->mutex);
+
+    while (1) { /* Consumer Loops, waiting if data not available or flushing if done */
+        wbuf_data_size = logfs->head - logfs->tail;
+        if (wbuf_data_size < logfs->B) {
+            /* Less than a full block in the buffer, check if we should flush, otherwise wait for producer */
+            if (logfs->done) {
+                break;
+            }
+            pthread_cond_wait(&logfs->data_avail, &logfs->mutex);
+            continue;
+        }
+        T = logfs->tail % wbuf_size;
+        /* Writes just one block to the device */
+        if (device_write(logfs->D, logfs->wbuf + T, logfs->tail, logfs->B) != 0) {
+            TRACE("device write failure in logfs consumer");
+            logfs->error = 1;
+            pthread_cond_signal(&logfs->space_avail);
+            pthread_mutex_unlock(&logfs->mutex);
+            return NULL;
+        } 
+        logfs->tail += logfs->B;
+        pthread_cond_signal(&logfs->space_avail);
+    }
+    
+    /* We've exited the while loop, check if there's less than a block remaining in wbuf to flush */
+    wbuf_data_size = logfs->head - logfs->tail;
+    if (0 != wbuf_data_size) {
+        T = logfs->tail % wbuf_size;
+        memset(logfs->wbuf + T + wbuf_data_size, 0, logfs->B - wbuf_data_size);
+        if (device_write(logfs->D, logfs->wbuf + T, logfs->tail, logfs->B) != 0) {
+            TRACE("flush failure in logfs consumer");
+            logfs->error = 1;
+            pthread_cond_signal(&logfs->space_avail);
+            pthread_mutex_unlock(&logfs->mutex);
+            return NULL;
+        } 
+    }
+
+    pthread_mutex_unlock(&logfs->mutex);
+    return NULL;
 }
 
 struct logfs *logfs_open(const char *pathname){
@@ -181,6 +224,9 @@ int logfs_read(struct logfs *logfs, void *buf, uint64_t off, size_t len);
 int logfs_append(struct logfs *logfs, const void *buf, uint64_t len){
     uint64_t free_space, H, wbuf_size, first_copy_size, chunk_size;
     const char *new_data_buf;
+
+    assert( logfs );
+    assert( !len || buf );
     
     new_data_buf = (const char *)buf;
     wbuf_size = (WCACHE_BLOCKS * logfs->B);
@@ -200,6 +246,11 @@ int logfs_append(struct logfs *logfs, const void *buf, uint64_t len){
 
         /* Ensure wbuf has enough free space to fit the full append, if not wait on space_avail signal */
         here: 
+            if (logfs->error) {
+                pthread_mutex_unlock(&logfs->mutex);
+                TRACE("worker failed in logfs_append");
+                return -1;
+            }
             free_space = (wbuf_size) - (logfs->head - logfs->tail); /* capacity - space occupied */
             if (chunk_size > free_space){
                 pthread_cond_wait(&logfs->space_avail, &logfs->mutex);
