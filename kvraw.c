@@ -68,13 +68,16 @@ kvraw_open(const char *pathname)
 		TRACE(0);
 		return NULL;
 	}
-	off = 0;
-	if (kvraw_append(kvraw, "", 1, "", 1, &off)) {
-		kvraw_close(kvraw);
-		TRACE(0);
-		return NULL;
+	kvraw->size = logfs_size(kvraw->logfs);
+	if (!kvraw->size) {
+		off = 0;
+		if (kvraw_append(kvraw, "", 1, "", 1, &off)) {
+			kvraw_close(kvraw);
+			TRACE(0);
+			return NULL;
+		}
+		assert( 0 == off );
 	}
-	assert( 0 == off );
 	return kvraw;
 }
 
@@ -151,5 +154,43 @@ kvraw_append(struct kvraw *kvraw,
 	}
 	kvraw->size += META_LEN + meta.key_len + meta.val_len;
 	(*off) = off_;
+	return 0;
+}
+
+uint64_t
+kvraw_size(const struct kvraw *kvraw)
+{
+	assert( kvraw );
+
+	return kvraw->size;
+}
+
+int
+kvraw_scan(struct kvraw *kvraw,
+	   void *key,
+	   uint64_t *key_len, /* in/out */
+	   uint64_t *val_len, /* out */
+	   uint64_t *off)     /* in/out */
+{
+	uint64_t key_len_;
+	struct meta meta;
+
+	assert( kvraw );
+	assert( key_len && (!(*key_len) || key) );
+	assert( val_len );
+	assert( off );
+
+	if (read_meta(kvraw, (*off), &meta)) {
+		TRACE(0);
+		return -1;
+	}
+	key_len_ = MIN(meta.key_len, (*key_len));
+	if (logfs_read(kvraw->logfs, key, KEY_OFF(*off), key_len_)) {
+		TRACE(0);
+		return -1;
+	}
+	(*key_len) = meta.key_len;
+	(*val_len) = meta.val_len;
+	(*off) += META_LEN + meta.key_len + meta.val_len;
 	return 0;
 }

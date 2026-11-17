@@ -102,6 +102,76 @@ chain_lookup(struct kvdb *kvdb,
 	return 0;
 }
 
+/* Rebuild index, size and waste by re-applying every record in log order,
+   exactly as mutate() applied them the first time. */
+static int
+replay(struct kvdb *kvdb)
+{
+	uint64_t *ref, rec, cur, end, key_len, val_len, val_len_;
+	void *key;
+	int live;
+
+	end = kvraw_size(kvdb->kvraw);
+	if (!(key = malloc(KVDB_MAX_KEY_LEN))) {
+		TRACE("out of memory");
+		return -1;
+	}
+
+	/* record at offset 0 is the dummy one, step over it */
+	rec = 0;
+	key_len = KVDB_MAX_KEY_LEN;
+	if (kvraw_scan(kvdb->kvraw, key, &key_len, &val_len, &rec)) {
+		FREE(key);
+		TRACE(0);
+		return -1;
+	}
+
+	while (rec < end) {
+		cur = rec; /* this record's own offset; scan moves rec to the next */
+		key_len = KVDB_MAX_KEY_LEN;
+		if (kvraw_scan(kvdb->kvraw, key, &key_len, &val_len, &rec)) {
+			FREE(key);
+			TRACE(0);
+			return -1;
+		}
+
+		/* was this key live BEFORE this record? (same steps as mutate) */
+		if (!(ref = index_update(kvdb->index, key, key_len))) {
+			FREE(key);
+			TRACE(0);
+			return -1;
+		}
+		{
+			uint64_t off = (*ref);
+
+			val_len_ = 0;
+			if (chain_lookup(kvdb, key, key_len, NULL, &val_len_, &off)) {
+				FREE(key);
+				TRACE(0);
+				return -1;
+			}
+			live = (off && val_len_);
+		}
+
+		/* counters */
+		if (!val_len) {          /* tombstone: a remove */
+			--kvdb->size;
+			++kvdb->waste;
+		}
+		else if (live) {         /* update or replace of a live key */
+			++kvdb->waste;
+		}
+		else {                   /* insert, or update of a missing key */
+			++kvdb->size;
+		}
+
+		/* this record is now the newest one for its slot */
+		(*ref) = cur;
+	}
+	FREE(key);
+	return 0;
+}
+
 static int /* -1|0|+1 */
 mutate(struct kvdb *kvdb,
        const void *key,
@@ -215,7 +285,8 @@ kvdb_open(const char *pathname)
 	}
 	memset(kvdb, 0, sizeof (struct kvdb));
 	if (!(kvdb->kvraw = kvraw_open(pathname)) ||
-	    !(kvdb->index = index_open())) {
+	    !(kvdb->index = index_open()) ||
+		replay(kvdb)) {
 		kvdb_close(kvdb);
 		TRACE(0);
 		return NULL;

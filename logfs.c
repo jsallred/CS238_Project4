@@ -14,6 +14,9 @@
 #define WCACHE_BLOCKS 32
 #define RCACHE_BLOCKS 256
 
+/* superblock lives in device block 0, log offset x is at device offset x+B */
+#define SB_MAGIC ( ((uint64_t)0x4c4f4746 << 32) | (uint64_t)0x53303031 )
+
 /**
  * Needs:
  *   pthread_create()
@@ -50,8 +53,63 @@ struct logfs {
     int space_ok;
     int worker_ok;
     int error;
+    int open_ok; /* set once logfs_open fully succeeded */
     
 };
+
+/* Called from logfs_open, before the worker exists, so no locking needed.
+   wbuf is used as a scratch buffer (it is block aligned, as O_DIRECT needs). */
+static int sb_load(struct logfs *logfs){
+    uint64_t magic, head, size, wbuf_size;
+
+    size = device_size(logfs->D);
+    wbuf_size = WCACHE_BLOCKS * logfs->B;
+
+    if (device_read(logfs->D, logfs->wbuf, 0, logfs->B)) {
+        TRACE("cannot read superblock");
+        return -1;
+    }
+    memcpy(&magic, logfs->wbuf, sizeof (magic));
+    memcpy(&head, logfs->wbuf + sizeof (magic), sizeof (head));
+    memset(logfs->wbuf, 0, (size_t)logfs->B);
+
+    if (SB_MAGIC != magic) {
+        return 0; /* fresh device: head = tail = 0 */
+    }
+    if (head > (size - logfs->B)) {
+        TRACE("corrupt superblock");
+        return -1;
+    }
+
+    /* restore: everything below tail is on the device, the partial last
+       block (if any) must be loaded back into the ring */
+    logfs->head = head;
+    logfs->tail = head - (head % logfs->B);
+    if (logfs->head != logfs->tail) {
+        if (device_read(logfs->D,
+                        logfs->wbuf + (logfs->tail % wbuf_size),
+                        logfs->tail + logfs->B,
+                        logfs->B)) {
+            TRACE("cannot read partial block");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Called from logfs_close after the worker has been joined. */
+static void sb_store(struct logfs *logfs){
+    uint64_t magic, head;
+
+    magic = SB_MAGIC;
+    head = logfs->head;
+    memset(logfs->wbuf, 0, (size_t)logfs->B);
+    memcpy(logfs->wbuf, &magic, sizeof (magic));
+    memcpy(logfs->wbuf + sizeof (magic), &head, sizeof (head));
+    if (device_write(logfs->D, logfs->wbuf, 0, logfs->B)) {
+        TRACE("cannot write superblock");
+    }
+}
 
 static void *worker_engine(void *arg){
     struct logfs *logfs = (struct logfs *)arg;
@@ -72,7 +130,7 @@ static void *worker_engine(void *arg){
         }
         T = logfs->tail % wbuf_size;
         /* Writes just one block to the device */
-        if (device_write(logfs->D, logfs->wbuf + T, logfs->tail, logfs->B) != 0) {
+        if (device_write(logfs->D, logfs->wbuf + T, logfs->tail + logfs->B, logfs->B) != 0) {
             TRACE("device write failure in logfs consumer");
             logfs->error = 1;
             pthread_cond_signal(&logfs->space_avail);
@@ -88,7 +146,7 @@ static void *worker_engine(void *arg){
     if (0 != wbuf_data_size) {
         T = logfs->tail % wbuf_size;
         memset(logfs->wbuf + T + wbuf_data_size, 0, logfs->B - wbuf_data_size);
-        if (device_write(logfs->D, logfs->wbuf + T, logfs->tail, logfs->B) != 0) {
+        if (device_write(logfs->D, logfs->wbuf + T, logfs->tail + logfs->B, logfs->B) != 0) {
             TRACE("flush failure in logfs consumer");
             logfs->error = 1;
             pthread_cond_signal(&logfs->space_avail);
@@ -146,6 +204,14 @@ struct logfs *logfs_open(const char *pathname){
     logfs->wbuf = (char *)memory_align(logfs->wbuf_, logfs->B);
     memset(logfs->wbuf, 0, logfs->B * WCACHE_BLOCKS);
 
+    /* Restore state from the superblock, if there is one */
+    if (sb_load(logfs)) {
+        logfs_close(logfs);
+        TRACE("logfs cannot load superblock");
+        return NULL;
+    }
+    logfs->open_ok = 1;
+
     /* Initialize our Mutex */
     /* Pass NULL for default arguments */
     if (pthread_mutex_init(&logfs->mutex, NULL) != 0){ 
@@ -190,6 +256,11 @@ void logfs_close(struct logfs* logfs){
             pthread_cond_signal(&logfs->data_avail);
             pthread_mutex_unlock(&logfs->mutex);
             pthread_join(logfs->worker, NULL);
+        }
+
+        /* Worker is finished and has flushed, record where the log ends */
+        if (logfs->open_ok && !logfs->error) {
+            sb_store(logfs);
         }
 
         /* Clean up remaining primitives */
@@ -266,7 +337,7 @@ int logfs_read(struct logfs *logfs, void *buf, uint64_t off, size_t len) {
 
             /* Cache Miss - fill cache from device read*/
             if ( (!logfs->rc_valid[offi]) || (logfs->rc_offs[offi] != blk)) {
-                if (device_read(logfs->D, logfs->rbuf + (logfs->B * offi), blk, logfs->B) != 0) {
+                if (device_read(logfs->D, logfs->rbuf + (logfs->B * offi), blk + logfs->B, logfs->B) != 0) {
                     pthread_mutex_unlock(&logfs->mutex);
                     TRACE("device read failure logfs");
                     return -1;
@@ -300,7 +371,7 @@ int logfs_append(struct logfs *logfs, const void *buf, uint64_t len) {
     pthread_mutex_lock(&logfs->mutex);
 
     /* check if the requested write will fit into remaining device capacity */
-    if ((logfs->head + len) > device_size(logfs->D)) {
+    if ((logfs->head + len) > (device_size(logfs->D) + logfs->B)) {
         pthread_mutex_unlock(&logfs->mutex);
         TRACE("device full in logfs_append");
         return -1;
@@ -337,5 +408,15 @@ int logfs_append(struct logfs *logfs, const void *buf, uint64_t len) {
     }
     pthread_mutex_unlock(&logfs->mutex);
     return 0;
+}
+
+uint64_t logfs_size(struct logfs *logfs){
+    uint64_t head;
+
+    assert( logfs );
+    pthread_mutex_lock(&logfs->mutex);
+    head = logfs->head;
+    pthread_mutex_unlock(&logfs->mutex);
+    return head;
 }
 

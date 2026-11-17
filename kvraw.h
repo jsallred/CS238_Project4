@@ -32,4 +32,15 @@ int kvraw_append(struct kvraw *kvraw,
 		 uint64_t val_len,
 		 uint64_t *off);
 
+uint64_t kvraw_size(const struct kvraw *kvraw);
+
+/* Reads the record at *off. Copies up to *key_len bytes of its key into key,
+   then reports the record's real key_len and val_len. On return *off is the
+   offset of the NEXT record in the log (not the chain pointer). */
+int kvraw_scan(struct kvraw *kvraw,
+	       void *key,
+	       uint64_t *key_len, /* in/out */
+	       uint64_t *val_len, /* out */
+	       uint64_t *off);    /* in/out */
+
 #endif /* _KVRAW_H_ */

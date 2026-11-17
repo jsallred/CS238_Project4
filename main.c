@@ -8,9 +8,13 @@
  */
 
 #include "term.h"
+#include "device.h"
 #include "kvdb.h"
 
 #define SLEN(s) ( safe_strlen(s) + 1 )
+
+#define PERSIST_N 500 /* keys created by the persist test */
+#define PERSIST_X 10  /* keys added after the first reopen */
 
 #define TEST(f,m)						\
 	do {							\
@@ -34,6 +38,38 @@
 	} while (0)
 
 static const char *PATHNAME;
+
+/**
+ * Destroys the superblock (device block 0) so that the next kvdb_open()
+ * starts from an empty database. Each test calls this first, since state
+ * now persists across open/close.
+ */
+
+static int
+wipe(void)
+{
+	struct device *device;
+	char *buf_, *buf;
+	uint64_t block;
+	int rv;
+
+	if (!(device = device_open(PATHNAME))) {
+		TRACE(0);
+		return -1;
+	}
+	block = device_block(device);
+	if (!(buf_ = malloc(2 * block))) {
+		device_close(device);
+		TRACE("out of memory");
+		return -1;
+	}
+	buf = (char *)memory_align(buf_, block);
+	memset(buf, 0, block);
+	rv = device_write(device, buf, 0, block);
+	FREE(buf_);
+	device_close(device);
+	return rv ? -1 : 0;
+}
 
 static void
 mk_object(char *key,
@@ -298,6 +334,149 @@ basic_logic(void)
 	return 0;
 }
 
+/**
+ * Persistence test helpers.
+ *
+ * persist_fill():  inserts keys 0..N-1 as "key<i>" = "a<i>", updates the
+ *                  even ones to "b<i>", then removes the multiples of 5.
+ * persist_check(): verifies the counters and every key. If extra is set,
+ *                  the keys "x0".."x9" must also exist, otherwise they
+ *                  must not.
+ */
+
+static int
+persist_fill(struct kvdb *kvdb)
+{
+	char key[32], val[32];
+	uint64_t i;
+
+	for (i=0; i<PERSIST_N; ++i) {
+		safe_sprintf(key, sizeof (key), "key%lu", (unsigned long)i);
+		safe_sprintf(val, sizeof (val), "a%lu", (unsigned long)i);
+		if (kvdb_insert(kvdb, key, SLEN(key), val, SLEN(val))) {
+			return -1;
+		}
+	}
+	for (i=0; i<PERSIST_N; i+=2) {
+		safe_sprintf(key, sizeof (key), "key%lu", (unsigned long)i);
+		safe_sprintf(val, sizeof (val), "b%lu", (unsigned long)i);
+		if (kvdb_update(kvdb, key, SLEN(key), val, SLEN(val))) {
+			return -1;
+		}
+	}
+	for (i=0; i<PERSIST_N; i+=5) {
+		safe_sprintf(key, sizeof (key), "key%lu", (unsigned long)i);
+		if (kvdb_remove(kvdb, key, SLEN(key), 0, 0)) {
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static int
+persist_check(struct kvdb *kvdb, uint64_t size, uint64_t waste, int extra)
+{
+	char key[32], val[32], val_[32];
+	uint64_t i, val_len_;
+	int rv;
+
+	if ((size != kvdb_size(kvdb)) || (waste != kvdb_waste(kvdb))) {
+		return -1;
+	}
+	for (i=0; i<PERSIST_N; ++i) {
+		safe_sprintf(key, sizeof (key), "key%lu", (unsigned long)i);
+		safe_sprintf(val, sizeof (val), "%c%lu",
+			     (0 == (i % 2)) ? 'b' : 'a', (unsigned long)i);
+		val_len_ = sizeof (val_);
+		rv = kvdb_lookup(kvdb, key, SLEN(key), val_, &val_len_);
+		if (0 == (i % 5)) {
+			if (+1 != rv) {
+				return -1; /* must have stayed removed */
+			}
+		}
+		else if (rv ||
+			 (SLEN(val) != val_len_) ||
+			 memcmp(val, val_, val_len_)) {
+			return -1;
+		}
+	}
+	for (i=0; i<PERSIST_X; ++i) {
+		safe_sprintf(key, sizeof (key), "x%lu", (unsigned long)i);
+		val_len_ = sizeof (val_);
+		rv = kvdb_lookup(kvdb, key, SLEN(key), val_, &val_len_);
+		if (extra) {
+			if (rv ||
+			    (SLEN(key) != val_len_) ||
+			    memcmp(key, val_, val_len_)) {
+				return -1;
+			}
+		}
+		else if (+1 != rv) {
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static int
+persist(void)
+{
+	uint64_t size, waste, i;
+	struct kvdb *kvdb;
+	char key[32];
+
+	/* session 1: build some state, then close */
+
+	if (!(kvdb = kvdb_open(PATHNAME))) {
+		TRACE(0);
+		return -1;
+	}
+	if (persist_fill(kvdb)) {
+		kvdb_close(kvdb);
+		TRACE("software");
+		return -1;
+	}
+	size = kvdb_size(kvdb);
+	waste = kvdb_waste(kvdb);
+	kvdb_close(kvdb);
+
+	/* session 2: everything restored? then keep appending */
+
+	if (!(kvdb = kvdb_open(PATHNAME))) {
+		TRACE(0);
+		return -1;
+	}
+	if (persist_check(kvdb, size, waste, 0)) {
+		kvdb_close(kvdb);
+		TRACE("software");
+		return -1;
+	}
+	for (i=0; i<PERSIST_X; ++i) {
+		safe_sprintf(key, sizeof (key), "x%lu", (unsigned long)i);
+		if (kvdb_insert(kvdb, key, SLEN(key), key, SLEN(key))) {
+			kvdb_close(kvdb);
+			TRACE("software");
+			return -1;
+		}
+	}
+	size += PERSIST_X;
+	kvdb_close(kvdb);
+
+	/* session 3: old and new data both survive a second reopen */
+
+	if (!(kvdb = kvdb_open(PATHNAME))) {
+		TRACE(0);
+		return -1;
+	}
+	if (persist_check(kvdb, size, waste, 1)) {
+		kvdb_close(kvdb);
+		TRACE("software");
+		return -1;
+	}
+	kvdb_close(kvdb);
+	return 0;
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -318,13 +497,20 @@ main(int argc, char *argv[])
 	printf("---------- TEST BEG ----------\n");
 	term_reset();
 
-	/* test */
+	/* test (state persists now, so start each test from an empty db) */
 
+	if (wipe()) { TRACE("wipe"); return -1; }
 	TEST(basic_logic, "basic_logic");
+	if (wipe()) { TRACE("wipe"); return -1; }
 	TEST(heavy_rewrite, "heavy_rewrite");
+	if (wipe()) { TRACE("wipe"); return -1; }
 	TEST(read_write_single, "read_write_single");
+	if (wipe()) { TRACE("wipe"); return -1; }
 	TEST(read_write_small, "read_write_small");
+	if (wipe()) { TRACE("wipe"); return -1; }
 	TEST(read_write_large, "read_write_large");
+	if (wipe()) { TRACE("wipe"); return -1; }
+	TEST(persist, "persist");
 
 	/* postlude */
 

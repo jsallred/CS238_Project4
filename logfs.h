@@ -60,4 +60,11 @@ int logfs_read(struct logfs *logfs, void *buf, uint64_t off, size_t len);
 
 int logfs_append(struct logfs *logfs, const void *buf, uint64_t len);
 
+/**
+ * Returns the number of bytes appended to the logfs so far, including bytes
+ * restored from a previous session.
+ */
+
+uint64_t logfs_size(struct logfs *logfs);
+
 #endif /* _LOGFS_H_ */
