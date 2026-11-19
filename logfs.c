@@ -14,6 +14,7 @@
 #define WCACHE_BLOCKS 32
 #define RCACHE_BLOCKS 256
 
+/* EXTRA CREDIT IMPLEMENTATION */
 /* superblock lives in device block 0, log offset x is at device offset x+B */
 #define SB_MAGIC ( ((uint64_t)0x4c4f4746 << 32) | (uint64_t)0x53303031 )
 
@@ -57,6 +58,7 @@ struct logfs {
     
 };
 
+/* EXTRA CREDIT IMPLEMENTATION */
 /* Called from logfs_open, before the worker exists, so no locking needed.
    wbuf is used as a scratch buffer (it is block aligned, as O_DIRECT needs). */
 static int sb_load(struct logfs *logfs){
@@ -97,6 +99,7 @@ static int sb_load(struct logfs *logfs){
     return 0;
 }
 
+/* EXTRA CREDIT IMPLEMENTATION */
 /* Called from logfs_close after the worker has been joined. */
 static void sb_store(struct logfs *logfs){
     uint64_t magic, head;
@@ -371,7 +374,7 @@ int logfs_append(struct logfs *logfs, const void *buf, uint64_t len) {
     pthread_mutex_lock(&logfs->mutex);
 
     /* check if the requested write will fit into remaining device capacity */
-    if ((logfs->head + len) > (device_size(logfs->D) + logfs->B)) {
+    if ((logfs->head + len) > (device_size(logfs->D) - logfs->B)) {
         pthread_mutex_unlock(&logfs->mutex);
         TRACE("device full in logfs_append");
         return -1;
@@ -410,6 +413,7 @@ int logfs_append(struct logfs *logfs, const void *buf, uint64_t len) {
     return 0;
 }
 
+/* Extra Credit Implementation */
 uint64_t logfs_size(struct logfs *logfs){
     uint64_t head;
 
